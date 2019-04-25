@@ -7,6 +7,8 @@ import argparse
 import os
 import sys
 
+import shutil
+
 import tensorflow as tf
 
 import boxnet_model_v2
@@ -17,8 +19,6 @@ parser = argparse.ArgumentParser()
 
 _HEIGHT = 256
 _WIDTH = 256
-_HEIGHT_TRAIN = 256
-_WIDTH_TRAIN = 256
 _DEPTH = 1
 _NUM_CLASSES = 3
 _BATCHSIZE = 1
@@ -30,13 +30,15 @@ _MOMENTUM = 0.9
 
 def input_fn(batch_size):
   
-  images = tf.random_normal([batch_size, _WIDTH_TRAIN, _HEIGHT_TRAIN, 1])
-  image_classes = tf.random_normal([batch_size, _WIDTH_TRAIN, _HEIGHT_TRAIN, _NUM_CLASSES])
-  image_ignore = tf.random_normal([batch_size, _WIDTH_TRAIN, _HEIGHT_TRAIN, 1])
+  images = tf.random_normal([batch_size, _WIDTH, _HEIGHT, 1])
+  image_classes = tf.random_normal([batch_size, _WIDTH, _HEIGHT, _NUM_CLASSES])
+  image_ignore = tf.random_normal([batch_size, _WIDTH, _HEIGHT, 1])
+  learning_rate = tf.constant(1e-8, shape=[batch_size])
 
   return {'images' : images, 
           'image_classes' : image_classes, 
-          'image_weights' : image_ignore}, images
+          'image_weights' : image_ignore, 
+          'training_learning_rate' : learning_rate}, images
 
 
 def boxnet_model_fn(features, labels, mode, params):
@@ -46,11 +48,11 @@ def boxnet_model_fn(features, labels, mode, params):
   inputs = features["images"] if mode == tf.estimator.ModeKeys.TRAIN else features["images_predict"]
   
   logits = network(inputs, mode == tf.estimator.ModeKeys.TRAIN)
-  logits = tf.reshape(logits, [logits.shape[0] * logits.shape[1] * logits.shape[2], _NUM_CLASSES])
+  logits = tf.reshape(logits, [-1, _WIDTH * _HEIGHT, _NUM_CLASSES])
   print(logits.shape)
 
   predictions = {
-      'classes': tf.argmax(logits, axis=1, name='argmax_tensor'),
+      'classes': tf.argmax(logits, axis=2, name='argmax_tensor'),
       'probabilities': tf.nn.softmax(logits, name='softmax_tensor')
   }
   
@@ -61,8 +63,8 @@ def boxnet_model_fn(features, labels, mode, params):
   if mode == tf.estimator.ModeKeys.PREDICT:
     return tf.estimator.EstimatorSpec(mode=mode, export_outputs=export_outputs, predictions=predictions)
   
-  input_labels = tf.reshape(features["image_classes"], [logits.shape[0], _NUM_CLASSES]);
-  input_weights = tf.reshape(features["image_weights"], [logits.shape[0]]);
+  input_labels = tf.reshape(features["image_classes"], [-1, _WIDTH * _HEIGHT, _NUM_CLASSES]);
+  input_weights = tf.reshape(features["image_weights"], [-1, _WIDTH * _HEIGHT]);
   
   # Calculate loss, which includes softmax cross entropy and L2 regularization.
   cross_entropy = tf.losses.softmax_cross_entropy(logits=logits, onehot_labels=input_labels, weights=input_weights, reduction=tf.losses.Reduction.MEAN)
@@ -75,7 +77,7 @@ def boxnet_model_fn(features, labels, mode, params):
   loss = cross_entropy + _WEIGHT_DECAY * tf.add_n([tf.nn.l2_loss(v) for v in tf.trainable_variables()])
   global_step = tf.train.get_or_create_global_step()
   
-  learning_rate = tf.placeholder(tf.float32, [], name="training_learning_rate") # replace with something small for pseudo-training
+  learning_rate = features["training_learning_rate"][0]
 
   optimizer = tf.train.MomentumOptimizer(learning_rate=learning_rate, momentum=_MOMENTUM)
   #optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate)
@@ -85,7 +87,7 @@ def boxnet_model_fn(features, labels, mode, params):
   with tf.control_dependencies(update_ops):
     train_op = optimizer.minimize(loss, global_step, name='train_momentum')
 
-  accuracy = tf.metrics.accuracy(tf.argmax(input_labels, axis=1), predictions['classes'])
+  accuracy = tf.metrics.accuracy(tf.argmax(input_labels, axis=2), predictions['classes'])
   metrics = {'accuracy': accuracy}
 
   # Create a tensor named train_accuracy for logging purposes
@@ -114,6 +116,9 @@ def boxnet_model_fn(features, labels, mode, params):
 def main(unused_argv):
   # Using the Winograd non-fused algorithms provides a small performance boost.
   os.environ['TF_ENABLE_WINOGRAD_NONFUSED'] = '1'
+  
+  if os.path.isdir('boxnet_model'):
+    shutil.rmtree('boxnet_model')
 
   # Set up a RunConfig to only save checkpoints once per training cycle.
   config = tf.ConfigProto()
@@ -126,16 +131,16 @@ def main(unused_argv):
                            'batch_size': _BATCHSIZE,
                        })
 
-  #boxnet.train(input_fn=lambda: input_fn(_BATCHSIZE))
+  boxnet.train_one_step(input_fn=lambda: input_fn(_BATCHSIZE))
 	  
-  feature_spec = {'images': tf.placeholder(tf.float32, [None, _WIDTH_TRAIN, _HEIGHT_TRAIN, 1], name="images"),
-                  'image_classes': tf.placeholder(tf.float32, [None, _WIDTH_TRAIN, _HEIGHT_TRAIN, _NUM_CLASSES], name="image_classes"),
-                  'image_weights': tf.placeholder(tf.float32, [None, _WIDTH_TRAIN, _HEIGHT_TRAIN, 1], name="image_weights"),
-                  'images_predict': tf.placeholder(tf.float32, [None, _WIDTH, _HEIGHT, 1], name="images_predict")}
+  feature_spec = {'images': tf.placeholder(tf.float32, [None, _WIDTH, _HEIGHT, 1], name="images"),
+                  'image_classes': tf.placeholder(tf.float32, [None, _WIDTH, _HEIGHT, _NUM_CLASSES], name="image_classes"),
+                  'image_weights': tf.placeholder(tf.float32, [None, _WIDTH, _HEIGHT, 1], name="image_weights"),
+                  'images_predict': tf.placeholder(tf.float32, [None, _WIDTH, _HEIGHT, 1], name="images_predict"),
+                  'training_learning_rate': tf.placeholder(tf.float32, [1], name="training_learning_rate")}
 	  
   boxnet.export_savedmodel(export_dir_base='boxnet_model_export', 
-                           serving_input_receiver_fn=tf.estimator.export.build_raw_serving_input_receiver_fn(features=feature_spec, 
-                                                                                                             default_batch_size=_BATCHSIZE),
+                           serving_input_receiver_fn=tf.estimator.export.build_raw_serving_input_receiver_fn(features=feature_spec),
                            export_name='BoxNet_256',
                            as_text=False)
 
